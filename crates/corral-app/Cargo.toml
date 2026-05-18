@@ -1,0 +1,45 @@
+[package]
+name = "corral-app"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "corral"
+path = "src/main.rs"
+
+[dependencies]
+corral-core.workspace = true
+corral-adapters.workspace = true
+gpui.workspace = true
+chrono.workspace = true
+crossbeam-channel.workspace = true
+notify.workspace = true
+notify-debouncer-mini.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# GPUI 0.2.2 only exposes `Window::resize`, which on macOS anchors the
+# NSWindow's top-left and so cannot keep the strip centred vertically as
+# it grows. We drop down to the NSWindow's `setFrame:display:animate:` to
+# move *and* resize atomically each animation tick. Versions pinned to
+# match gpui's transitive deps so the symbols line up.
+cocoa = "=0.26.0"
+objc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints.rust]
+# The `objc::msg_send!` macro expands to code referencing
+# `cfg(feature = "cargo-clippy")`, a cfg Cargo no longer treats as
+# expected. The warning lands in *our* crate (per macro expansion
+# rules), so allow it here rather than upstream-patching `objc`.
+unexpected_cfgs = "allow"

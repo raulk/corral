@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Hardened runtime entitlements for the notarized release build.
+
+      Corral reads other processes via libproc and sysctl(KERN_PROCARGS2)
+      and shells out to osascript / `open -R`. Neither requires JIT,
+      unsigned executable memory, nor disabled library validation —
+      libproc and sysctl are kernel interfaces, not unsigned code paths,
+      and osascript runs in its own process with its own entitlements.
+
+      The sandbox is intentionally NOT enabled because that would forbid
+      the cross-process inspection that is the whole point of this app.
+      The Mac App Store is out of scope by design (see PLAN.md).
+
+      If a future dependency (e.g. a hardware-accelerated codec, a
+      runtime-loaded Metal shader compiler) actually needs JIT, document
+      the specific caller here and re-add the corresponding entitlement.
+    -->
+    <!-- Triggers the Automation permission prompts on first osascript call. -->
+    <key>com.apple.security.automation.apple-events</key>
+    <true/>
+</dict>
+</plist>

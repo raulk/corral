@@ -1,0 +1,15 @@
+[package]
+name = "corral-adapters"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+corral-core.workspace = true
+objc2.workspace = true
+objc2-app-kit.workspace = true
+objc2-foundation.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

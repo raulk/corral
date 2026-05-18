@@ -1,0 +1,9 @@
+/target
+.DS_Store
+*.log
+.serena/
+.agents/
+skills-lock.json
+
+# Harness
+tests/node_modules

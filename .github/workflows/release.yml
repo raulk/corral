@@ -1,0 +1,337 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, for example 0.1.0"
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: read
+
+env:
+  CARGO_TERM_COLOR: always
+  GH_REPO: ${{ github.repository }}
+  RUST_BACKTRACE: 1
+
+jobs:
+  update_changelog:
+    name: Update changelog
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2, published 2026-01-09
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Validate release tag
+        env:
+          TAG: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          version="${TAG#v}"
+          if [[ "$TAG" != "v${version}" || ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "release tag must look like v0.1.0 or v0.1.0-rc.1, got $TAG" >&2
+            exit 1
+          fi
+
+          tag_commit="$(git rev-list -n 1 "$TAG")"
+          if ! git merge-base --is-ancestor "$tag_commit" "origin/${DEFAULT_BRANCH}"; then
+            echo "release tag $TAG must point to a commit on ${DEFAULT_BRANCH}" >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_ENV"
+          echo "tag_commit=$tag_commit" >> "$GITHUB_ENV"
+          git checkout --detach "$tag_commit"
+
+      - name: Generate changelog
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # v4.8.0, published 2026-04-26
+        with:
+          config: cliff.toml
+          args: --output CHANGELOG.md
+        env:
+          GITHUB_REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Commit changelog to default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          cp CHANGELOG.md "$RUNNER_TEMP/CHANGELOG.md"
+          git checkout "$DEFAULT_BRANCH"
+          cp "$RUNNER_TEMP/CHANGELOG.md" CHANGELOG.md
+
+          if git diff --quiet -- CHANGELOG.md; then
+            echo "CHANGELOG.md is already current"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          git commit -m "docs(release): update changelog for ${version}"
+          git push origin "HEAD:${DEFAULT_BRANCH}"
+
+  create_draft_release:
+    name: Create draft release
+    needs:
+      - update_changelog
+    if: always() && (needs.update_changelog.result == 'success' || needs.update_changelog.result == 'skipped')
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.metadata.outputs.tag }}
+      version: ${{ steps.metadata.outputs.version }}
+      asset_dmg: ${{ steps.metadata.outputs.asset_dmg }}
+      asset_sha: ${{ steps.metadata.outputs.asset_sha }}
+      release_notes_args: ${{ steps.metadata.outputs.release_notes_args }}
+    steps:
+      - name: Prepare release metadata
+        id: metadata
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          version="${VERSION_INPUT:-}"
+          if [[ -z "$version" ]]; then
+            version="$REF_NAME"
+          fi
+          version="${version#v}"
+
+          if [[ "v${version}" != "$REF_NAME" && -z "${VERSION_INPUT:-}" ]]; then
+            echo "tag release must be pushed as v<version>, got $REF_NAME" >&2
+            exit 1
+          fi
+
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "version must look like 0.1.0 or 0.1.0-rc.1" >&2
+            exit 1
+          fi
+
+          tag="v${version}"
+          asset_dmg="Corral-${version}-arm64-unsigned.dmg"
+          asset_sha="SHA256SUMS"
+          if [[ -n "${VERSION_INPUT:-}" ]]; then
+            release_notes_args="--unreleased --tag ${tag} --strip header"
+          else
+            release_notes_args="--latest --strip header"
+          fi
+
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "asset_dmg=$asset_dmg"
+            echo "asset_sha=$asset_sha"
+            echo "release_notes_args=$release_notes_args"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2, published 2026-01-09
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Prepare release notes directory
+        run: mkdir -p target
+
+      - name: Generate release notes
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # v4.8.0, published 2026-04-26
+        with:
+          config: cliff.toml
+          args: ${{ steps.metadata.outputs.release_notes_args }}
+        env:
+          OUTPUT: target/generated-release-notes.md
+          GITHUB_REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Add unsigned macOS note
+        run: |
+          set -euo pipefail
+          {
+            cat target/generated-release-notes.md
+            printf '\n## macOS\n\nUnsigned arm64 macOS draft release. Requires macOS 13 Ventura or later on Apple Silicon.\n'
+          } > target/release-notes.md
+
+      - name: Create or update draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+          TAG: ${{ steps.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            is_draft="$(gh release view "$TAG" --json isDraft -q '.isDraft')"
+            if [[ "$is_draft" != "true" ]]; then
+              echo "release $TAG already exists and is not a draft" >&2
+              exit 1
+            fi
+            echo "Updating existing draft release $TAG"
+            gh release edit "$TAG" \
+              --title "Corral ${VERSION}" \
+              --notes-file target/release-notes.md
+          else
+            gh release create "$TAG" \
+              --draft \
+              --target "$GITHUB_SHA" \
+              --title "Corral ${VERSION}" \
+              --notes-file target/release-notes.md
+          fi
+
+  validate:
+    name: Validate
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2, published 2026-01-09
+
+      - name: Set Cargo parallelism
+        run: echo "CARGO_BUILD_JOBS=$(sysctl -n hw.logicalcpu)" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1, published 2026-03-12
+        with:
+          prefix-key: v1-rust-release
+          cache-on-failure: true
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@ec28e287910af896fd98e04056d31fa68607e7ad # v2.77.4, published 2026-05-10
+        with:
+          tool: cargo-nextest
+
+      - name: Test
+        run: cargo nextest run --workspace
+
+  build_macos_arm64:
+    name: Build macOS arm64
+    runs-on: macos-15
+    needs:
+      - create_draft_release
+      - validate
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2, published 2026-01-09
+
+      - name: Set Cargo parallelism
+        run: echo "CARGO_BUILD_JOBS=$(sysctl -n hw.logicalcpu)" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1, published 2026-03-12
+        with:
+          prefix-key: v1-rust-release
+          cache-on-failure: true
+
+      - name: Install just
+        uses: taiki-e/install-action@ec28e287910af896fd98e04056d31fa68607e7ad # v2.77.4, published 2026-05-10
+        with:
+          tool: just
+
+      - name: Install dmgbuild
+        run: |
+          python3 -m venv .venv-dmgbuild
+          .venv-dmgbuild/bin/python -m pip install dmgbuild==1.6.7
+          echo "$PWD/.venv-dmgbuild/bin" >> "$GITHUB_PATH"
+
+      - name: Build unsigned DMG
+        run: just unsigned-dmg
+
+      - name: Validate DMG layout
+        run: |
+          set -euo pipefail
+          mountpoint="$(mktemp -d)"
+          trap 'hdiutil detach "$mountpoint" >/dev/null 2>&1 || true; rmdir "$mountpoint" >/dev/null 2>&1 || true' EXIT
+          hdiutil verify target/Corral.dmg
+          hdiutil attach target/Corral.dmg -nobrowse -readonly -mountpoint "$mountpoint"
+          test -d "$mountpoint/Corral.app"
+          test -L "$mountpoint/Applications"
+          test "$(readlink "$mountpoint/Applications")" = "/Applications"
+          test -f "$mountpoint/.background.png"
+          codesign --verify --deep --strict --verbose=4 "$mountpoint/Corral.app"
+
+      - name: Prepare release assets
+        env:
+          ASSET_DMG: ${{ needs.create_draft_release.outputs.asset_dmg }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-artifacts
+          cp target/Corral.dmg "release-artifacts/${ASSET_DMG}"
+          (
+            cd release-artifacts
+            shasum -a 256 "${ASSET_DMG}" > SHA256SUMS
+          )
+          lipo -archs target/app/Corral.app/Contents/MacOS/corral | grep -qx arm64
+          plutil -p target/app/Corral.app/Contents/Info.plist
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1, published 2026-04-10
+        with:
+          name: release-artifacts
+          path: release-artifacts/*
+          if-no-files-found: error
+
+  upload_release_assets:
+    name: Upload release assets
+    runs-on: ubuntu-24.04
+    needs:
+      - create_draft_release
+      - build_macos_arm64
+    steps:
+      - name: Download workflow artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1, published 2026-03-11
+        with:
+          name: release-artifacts
+          path: release-artifacts
+
+      - name: Upload assets to draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.create_draft_release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" release-artifacts/* --clobber
+
+  validate_release_assets:
+    name: Validate release assets
+    runs-on: ubuntu-24.04
+    needs:
+      - create_draft_release
+      - upload_release_assets
+    steps:
+      - name: Validate expected release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.create_draft_release.outputs.tag }}
+          ASSET_DMG: ${{ needs.create_draft_release.outputs.asset_dmg }}
+          ASSET_SHA: ${{ needs.create_draft_release.outputs.asset_sha }}
+        run: |
+          set -euo pipefail
+          expected="$(jq -cn --arg dmg "$ASSET_DMG" --arg sha "$ASSET_SHA" '[$dmg, $sha] | sort')"
+          actual="$(gh release view "$TAG" --json assets -q '[.assets[].name] | sort')"
+
+          if [[ "$actual" != "$expected" ]]; then
+            echo "release assets do not match expected set" >&2
+            echo "expected: $expected" >&2
+            echo "actual:   $actual" >&2
+            exit 1
+          fi
+
+          gh release view "$TAG" --json isDraft -q '.isDraft' | grep -qx true

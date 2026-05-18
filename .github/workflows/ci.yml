@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  ci:
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2, published 2026-01-09
+
+      # Saturate all cores; sysctl is the macOS equivalent of nproc.
+      - name: Set Cargo parallelism
+        run: echo "CARGO_BUILD_JOBS=$(sysctl -n hw.logicalcpu)" >> "$GITHUB_ENV"
+
+      # Caches ~/.cargo/registry/{index,cache}, ~/.cargo/git/db, and target/.
+      # Keyed on rust-toolchain.toml + Cargo.lock so a pinned-toolchain bump or
+      # any dependency change busts the cache cleanly. Bump prefix-key to
+      # manually invalidate without touching dependencies.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1, published 2026-03-12
+        with:
+          prefix-key: v1-rust
+          cache-on-failure: true
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      # Compiles the entire workspace as a side-effect; subsequent steps are
+      # linking-only (free after cache restore).
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@ec28e287910af896fd98e04056d31fa68607e7ad # v2.77.4, published 2026-05-10
+        with:
+          tool: cargo-nextest
+
+      - name: Test
+        run: cargo nextest run --workspace
+
+      # Verifies the final binary links cleanly (catches missing symbols that
+      # clippy doesn't exercise).
+      - name: Build
+        run: cargo build -p corral-app
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0, published 2026-03-14
+
+      - name: Install test harness deps
+        run: bun install --frozen-lockfile
+        working-directory: tests
+
+      # Integration tests require a live display and running agents; CI only
+      # verifies that the harness compiles.
+      - name: Typecheck test harness
+        run: bunx tsc --noEmit
+        working-directory: tests
