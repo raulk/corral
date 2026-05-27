@@ -1,4 +1,5 @@
 use crate::generic::GenericAdapter;
+use corral_core::agent::Tool;
 use corral_core::proc::ProcessId;
 use corral_core::trace::{self, FocusResult, FocusStrategy, TraceEvent};
 use objc2_app_kit::NSRunningApplication;
@@ -14,6 +15,7 @@ pub struct ParentApp {
 #[derive(Debug, Clone)]
 pub struct FocusContext {
     pub cli_pid: ProcessId,
+    pub tool: Tool,
     pub cli_tty: Option<PathBuf>,
     pub parent_app: Option<ParentApp>,
     /// The agent's working directory. `None` when libproc couldn't
@@ -284,6 +286,7 @@ mod tests {
     fn ctx() -> FocusContext {
         FocusContext {
             cli_pid: ProcessId(42),
+            tool: Tool::Claude,
             cli_tty: None,
             parent_app: Some(ParentApp {
                 pid: ProcessId(7),

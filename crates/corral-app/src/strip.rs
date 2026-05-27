@@ -1,5 +1,4 @@
 use crate::context_menu;
-use crate::focus::focus_agent_async;
 use crate::tile::{TILE_SIZE, render_tile};
 use crate::tooltip;
 use crate::window_geom;
@@ -576,6 +575,7 @@ fn group_divider() -> gpui::AnyElement {
 
 fn tile_menu_items(
     pid: ProcessId,
+    tool: Tool,
     tty: Option<std::path::PathBuf>,
     cwd: Option<std::path::PathBuf>,
     session_id: uuid::Uuid,
@@ -589,7 +589,7 @@ fn tile_menu_items(
     let focus_cwd = cwd.clone();
     vec![
         MenuItem::action("Focus terminal", move |app| {
-            crate::focus::focus_agent_async(app, pid, tty.clone(), focus_cwd.clone());
+            focus_agent_with_feedback(app, pid, tool, tty.clone(), focus_cwd.clone(), None);
         }),
         reveal_action("Reveal transcript in Finder", transcript),
         MenuItem::separator(),
@@ -597,6 +597,49 @@ fn tile_menu_items(
         copy_action("Copy working directory", cwd_display),
         copy_action("Copy PID", pid.to_string()),
     ]
+}
+
+fn focus_agent_with_feedback(
+    app: &mut App,
+    pid: ProcessId,
+    tool: Tool,
+    tty: Option<std::path::PathBuf>,
+    cwd: Option<std::path::PathBuf>,
+    anchor: Option<(gpui::Point<Pixels>, Pixels)>,
+) {
+    let request_id = crate::focus::next_request_id();
+    app.spawn(async move |cx| {
+        let result = cx
+            .background_executor()
+            .spawn(async move { crate::focus::focus_for_request(request_id, pid, tool, tty, cwd) })
+            .await;
+        let _ = cx.update(move |app| match result {
+            Ok(()) => tooltip::close_focus_error(app),
+            Err(error) => {
+                let message = friendly_focus_error(&error);
+                if let Some((strip_origin, anchor_y)) = anchor {
+                    tooltip::open_focus_error(app, message, strip_origin, anchor_y);
+                } else {
+                    tooltip::open_focus_error_default(app, message);
+                }
+            }
+        });
+    })
+    .detach();
+}
+
+fn friendly_focus_error(error: &str) -> String {
+    if let Some(rest) = error.split("ambiguous target: ").nth(1) {
+        let count = rest.split_whitespace().next().unwrap_or("multiple");
+        return format!("{count} terminal tabs match this session. Corral didn’t guess.");
+    }
+    if error.contains("permission denied") {
+        return "macOS denied terminal automation permission.".into();
+    }
+    if error.contains("not found") {
+        return "Couldn’t find the terminal tab for this session.".into();
+    }
+    "The terminal app did not accept the focus request.".into()
 }
 
 impl Render for Strip {
@@ -849,6 +892,7 @@ impl Render for Strip {
             }
             prev_state = Some(row.agent.state);
             let pid = row.agent.pid;
+            let tool = row.agent.tool;
             let tty = row.agent.tty.clone();
             let cwd = row.agent.cwd.clone();
             let transcript = row.agent.transcript_path.clone();
@@ -882,8 +926,15 @@ impl Render for Strip {
                 {
                     let tty = tty.clone();
                     let cwd = cwd.clone();
-                    move |_ev, _window, app| {
-                        focus_agent_async(app, pid, tty.clone(), cwd.clone());
+                    move |ev, window, app| {
+                        focus_agent_with_feedback(
+                            app,
+                            pid,
+                            tool,
+                            tty.clone(),
+                            cwd.clone(),
+                            Some((window.bounds().origin, ev.position.y)),
+                        );
                     }
                 },
                 {
@@ -898,6 +949,7 @@ impl Render for Strip {
                         let anchor = context_menu::anchor_left_of_strip(strip_origin, ev.position);
                         let items = tile_menu_items(
                             pid,
+                            tool,
                             tty.clone(),
                             cwd.clone(),
                             session_id,

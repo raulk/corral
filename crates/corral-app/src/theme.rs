@@ -15,7 +15,7 @@ use corral_core::status::AgentState;
 pub const STATE_ACTIVE: u32 = 0x22c55e; // green-500
 pub const STATE_AWAITING_USER: u32 = 0xec4899; // pink-500
 pub const STATE_NEEDS_INPUT: u32 = 0xf59e0b; // amber-500
-pub const STATE_IDLE: u32 = 0x71717a; // zinc-500
+pub const STATE_IDLE: u32 = STATE_NEEDS_INPUT;
 pub const STATE_CLOSED: u32 = 0x3f3f46; // zinc-700
 
 // Subtle brand tints over the dark strip. Computed as ~25% of the brand

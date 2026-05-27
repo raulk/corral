@@ -5,29 +5,15 @@
 //! so the public entry point spawns onto `BackgroundExecutor` and returns.
 
 use corral_adapters::{FocusContext, ParentApp, default_adapters, dispatch, resolve_parent_app};
+use corral_core::agent::Tool;
 use corral_core::proc::ProcessId;
 use corral_core::trace::{self, TraceEvent};
-use gpui::App;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub fn focus_agent_async(
-    cx: &App,
-    cli_pid: ProcessId,
-    cli_tty: Option<PathBuf>,
-    cwd: Option<PathBuf>,
-) {
-    let request_id = next_request_id();
-    cx.background_executor()
-        .spawn(async move {
-            focus_agent(request_id, cli_pid, cli_tty, cwd);
-        })
-        .detach();
-}
-
 /// Monotonic request id paired with each `FocusRequested` /
 /// `FocusDispatched` event so the harness can correlate them.
-fn next_request_id() -> u64 {
+pub fn next_request_id() -> u64 {
     static COUNTER: AtomicU64 = AtomicU64::new(1);
     COUNTER.fetch_add(1, Ordering::Relaxed)
 }
@@ -39,22 +25,28 @@ fn next_request_id() -> u64 {
 pub fn focus_for_request(
     request_id: u64,
     cli_pid: ProcessId,
+    tool: Tool,
     cli_tty: Option<PathBuf>,
     cwd: Option<PathBuf>,
-) {
-    focus_agent(request_id, cli_pid, cli_tty, cwd);
+) -> Result<(), String> {
+    focus_agent(request_id, cli_pid, tool, cli_tty, cwd).map_err(|e| {
+        tracing::warn!(error = %e, pid = %cli_pid, "focus dispatch failed");
+        e.to_string()
+    })
 }
 
 fn focus_agent(
     request_id: u64,
     cli_pid: ProcessId,
+    tool: Tool,
     cli_tty: Option<PathBuf>,
     cwd: Option<PathBuf>,
-) {
+) -> Result<(), corral_adapters::AdapterError> {
     let parent_app =
         resolve_parent_app(cli_pid).map(|(pid, bundle_id)| ParentApp { pid, bundle_id });
     let ctx = FocusContext {
         cli_pid,
+        tool,
         cli_tty,
         parent_app,
         cwd,
@@ -65,7 +57,5 @@ fn focus_agent(
         request_id,
     });
     let adapters = default_adapters();
-    if let Err(e) = dispatch(&adapters, ctx) {
-        tracing::warn!(error = %e, pid = %cli_pid, "focus dispatch failed");
-    }
+    dispatch(&adapters, ctx).map(|_| ())
 }

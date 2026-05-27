@@ -32,6 +32,8 @@ const TOOLTIP_WIDTH: f32 = 320.0;
 const TOOLTIP_HEIGHT: f32 = 248.0;
 const TOOLTIP_GAP_FROM_STRIP: f32 = 8.0;
 const TOOLTIP_RADIUS: f32 = 8.0;
+const FOCUS_ERROR_WIDTH: f32 = 260.0;
+const FOCUS_ERROR_HEIGHT: f32 = 86.0;
 const TOOLTIP_LABEL_W: f32 = 70.0;
 const CWD_MAX_CHARS: usize = 32;
 const HOST_MAX_CHARS: usize = 28;
@@ -66,6 +68,43 @@ pub struct TooltipData {
 
 struct TooltipView {
     data: TooltipData,
+}
+
+struct FocusErrorView {
+    message: String,
+}
+
+impl Render for FocusErrorView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .size_full()
+            .px_3()
+            .py_2()
+            .rounded(px(TOOLTIP_RADIUS))
+            .border_1()
+            .border_color(rgb(0x7f1d1d))
+            .bg(rgb(0x211416))
+            .text_color(rgb(TOOLTIP_FG))
+            .text_size(px(11.0))
+            .shadow_lg()
+            .child(
+                div()
+                    .text_color(rgb(0xfca5a5))
+                    .text_size(px(12.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child("Couldn’t focus terminal"),
+            )
+            .child(
+                div()
+                    .text_color(rgb(0xd4d4d8))
+                    .text_size(px(10.5))
+                    .line_height(px(14.0))
+                    .child(self.message.clone()),
+            )
+    }
 }
 
 impl Render for TooltipView {
@@ -353,6 +392,10 @@ fn state_chip(state: AgentState) -> impl IntoElement {
 pub struct TooltipPopup(Option<WindowHandle<TooltipView>>);
 impl gpui::Global for TooltipPopup {}
 
+#[derive(Default)]
+pub struct FocusErrorPopup(Option<WindowHandle<FocusErrorView>>);
+impl gpui::Global for FocusErrorPopup {}
+
 /// Open or replace the hover popup with `data`. `strip_origin` is the
 /// strip window's top-left in screen coordinates and `anchor_y` is the
 /// hovered tile's y in strip-window-local coordinates; together they
@@ -417,12 +460,97 @@ pub fn open(cx: &mut App, data: TooltipData, strip_origin: Point<Pixels>, anchor
     }
 }
 
+pub fn open_focus_error(
+    cx: &mut App,
+    message: String,
+    strip_origin: Point<Pixels>,
+    anchor_y: Pixels,
+) {
+    close_focus_error(cx);
+
+    let origin_x = strip_origin.x - px(FOCUS_ERROR_WIDTH) - px(TOOLTIP_GAP_FROM_STRIP);
+    let origin_y = strip_origin.y + anchor_y - px(FOCUS_ERROR_HEIGHT * 0.5);
+    open_focus_error_at(cx, message, point(origin_x, origin_y));
+}
+
+pub fn open_focus_error_default(cx: &mut App, message: String) {
+    let origin = if let Some(display) = cx.primary_display() {
+        let db = display.bounds();
+        point(
+            db.origin.x + db.size.width - px(FOCUS_ERROR_WIDTH + 52.0),
+            db.origin.y + db.size.height * 0.5 - px(FOCUS_ERROR_HEIGHT * 0.5),
+        )
+    } else {
+        point(px(20.0), px(20.0))
+    };
+    open_focus_error_at(cx, message, origin);
+}
+
+fn open_focus_error_at(cx: &mut App, message: String, origin: Point<Pixels>) {
+    let (origin_x, origin_y) = if let Some(display) = cx.primary_display() {
+        let db = display.bounds();
+        let min_x = db.origin.x;
+        let min_y = db.origin.y;
+        let max_x = db.origin.x + db.size.width - px(FOCUS_ERROR_WIDTH);
+        let max_y = db.origin.y + db.size.height - px(FOCUS_ERROR_HEIGHT);
+        (origin.x.clamp(min_x, max_x), origin.y.clamp(min_y, max_y))
+    } else {
+        (origin.x, origin.y)
+    };
+
+    let bounds = Bounds {
+        origin: point(origin_x, origin_y),
+        size: size(px(FOCUS_ERROR_WIDTH), px(FOCUS_ERROR_HEIGHT)),
+    };
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: None,
+        window_background: WindowBackgroundAppearance::Transparent,
+        focus: false,
+        show: true,
+        kind: WindowKind::PopUp,
+        is_movable: false,
+        is_resizable: false,
+        is_minimizable: false,
+        app_id: None,
+        window_min_size: None,
+        window_decorations: None,
+        tabbing_identifier: None,
+        ..Default::default()
+    };
+
+    match cx.open_window(options, |_, app| app.new(|_| FocusErrorView { message })) {
+        Ok(handle) => {
+            cx.set_global(FocusErrorPopup(Some(handle)));
+            let async_app = cx.to_async();
+            cx.spawn(async move |cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(4))
+                    .await;
+                let _ = async_app.update(close_focus_error);
+            })
+            .detach();
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "tooltip: focus error window failed");
+        }
+    }
+}
+
 /// Close the active hover popup, if one is open. Safe to call when none.
 pub fn close(cx: &mut App) {
     let handle = cx.try_global::<TooltipPopup>().and_then(|p| p.0);
     if let Some(handle) = handle {
         let _ = handle.update(cx, |_, window, _| window.remove_window());
         cx.set_global(TooltipPopup(None));
+    }
+}
+
+pub fn close_focus_error(cx: &mut App) {
+    let handle = cx.try_global::<FocusErrorPopup>().and_then(|p| p.0);
+    if let Some(handle) = handle {
+        let _ = handle.update(cx, |_, window, _| window.remove_window());
+        cx.set_global(FocusErrorPopup(None));
     }
 }
 

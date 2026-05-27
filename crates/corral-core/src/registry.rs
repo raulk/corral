@@ -7,7 +7,9 @@
 
 use crate::agent::{Agent, Tool, discover};
 use crate::kqueue::KqueueCommand;
-use crate::proc::{ProcessId, ProcessKey, claude_session_record_for, process_start_time};
+use crate::proc::{
+    ClaudeSessionRecord, ProcessId, ProcessKey, claude_session_record_for, process_start_time,
+};
 use crate::status::{AgentState, compute_state};
 use crate::trace::{self, ExitSource, LifecycleKind, TraceEvent};
 use crate::transcript::{
@@ -80,6 +82,7 @@ struct Entry {
     offset: u64,
     last_lifecycle: Option<LifecycleEvent>,
     last_write_at: Option<DateTime<Utc>>,
+    session_state: Option<AgentState>,
 }
 
 pub struct Registry {
@@ -272,6 +275,7 @@ impl Registry {
                     existing.offset = 0;
                     existing.last_lifecycle = None;
                     existing.last_write_at = None;
+                    existing.session_state = None;
                     self.unindex_transcript(key, &old_path);
                     self.index_transcript(key, new_path.clone());
                     trace::emit(TraceEvent::AgentRebound {
@@ -299,6 +303,7 @@ impl Registry {
                             offset: 0,
                             last_lifecycle: None,
                             last_write_at: None,
+                            session_state: None,
                         },
                     );
                     self.index_transcript(key, path);
@@ -340,21 +345,47 @@ impl Registry {
             return;
         }
         let Some(rec) = claude_session_record_for(entry.agent.pid) else {
+            entry.session_state = None;
+            self.emit_state_if_changed(key, Utc::now());
             return;
         };
-        if !rec.is_waiting_for_ask_user_question() {
+        let Some(session_state) = claude_session_state(&rec) else {
+            entry.session_state = None;
+            self.emit_state_if_changed(key, Utc::now());
             return;
-        }
+        };
         let at = rec
             .updated_at_ms
             .and_then(DateTime::<Utc>::from_timestamp_millis)
             .unwrap_or_else(Utc::now);
-        entry.last_lifecycle = Some(LifecycleEvent::AwaitingUser { at });
+        entry.session_state = Some(session_state);
         entry.last_write_at = Some(at);
         entry.agent.last_lifecycle_at = Some(at);
-        if entry.agent.current_action.as_deref() != Some("Asking question") {
+        if session_state == AgentState::AwaitingUser {
+            let action = rec
+                .waiting_for
+                .as_deref()
+                .map(waiting_action_label)
+                .unwrap_or("Waiting");
+            if entry.agent.current_action.as_deref() != Some(action) {
+                entry.agent.last_action = entry.agent.current_action.take();
+                entry.agent.current_action = Some(action.into());
+                let _ = self.out.send(RegistryEvent::MetadataChanged {
+                    pid: entry.agent.pid,
+                    model: entry.agent.model.clone(),
+                    git_branch: entry.agent.git_branch.clone(),
+                    session_title: entry.agent.session_title.clone(),
+                    current_action: entry.agent.current_action.clone(),
+                    last_action: entry.agent.last_action.clone(),
+                });
+            }
+        } else if entry
+            .agent
+            .current_action
+            .as_deref()
+            .is_some_and(is_session_wait_action)
+        {
             entry.agent.last_action = entry.agent.current_action.take();
-            entry.agent.current_action = Some("Asking question".into());
             let _ = self.out.send(RegistryEvent::MetadataChanged {
                 pid: entry.agent.pid,
                 model: entry.agent.model.clone(),
@@ -564,12 +595,14 @@ impl Registry {
             return;
         };
         let pid = entry.agent.pid;
-        let new = compute_state(
-            entry.last_lifecycle.as_ref(),
-            entry.last_write_at,
-            now,
-            true,
-        );
+        let new = entry.session_state.unwrap_or_else(|| {
+            compute_state(
+                entry.last_lifecycle.as_ref(),
+                entry.last_write_at,
+                now,
+                true,
+            )
+        });
         if entry.agent.state != new {
             entry.agent.state = new;
             let last_lifecycle_at = entry.agent.last_lifecycle_at;
@@ -607,6 +640,29 @@ impl Registry {
             self.remove_key(key, ExitSource::DiscoveryReconcile);
         }
     }
+}
+
+fn claude_session_state(rec: &ClaudeSessionRecord) -> Option<AgentState> {
+    match rec.status.as_deref() {
+        Some("waiting") => Some(AgentState::AwaitingUser),
+        Some("busy") => Some(AgentState::Active),
+        Some("idle") => Some(AgentState::Idle),
+        _ => None,
+    }
+}
+
+fn waiting_action_label(waiting_for: &str) -> &'static str {
+    if waiting_for.contains("permission prompt") {
+        "Permission prompt"
+    } else if waiting_for.contains("AskUserQuestion") {
+        "Asking question"
+    } else {
+        "Waiting"
+    }
+}
+
+fn is_session_wait_action(action: &str) -> bool {
+    matches!(action, "Waiting" | "Permission prompt" | "Asking question")
 }
 
 /// Overwrite `slot` with a clone of `new` when both are `Some` and differ;
@@ -652,6 +708,59 @@ mod discovery_bracket_tests {
             last_action: None,
             binding_source: BindingSource::SessionRecord,
         }
+    }
+
+    fn make_session_record(status: Option<&str>, waiting_for: Option<&str>) -> ClaudeSessionRecord {
+        ClaudeSessionRecord {
+            pid: ProcessId(123),
+            session_id: Uuid::new_v4(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            status: status.map(str::to_owned),
+            waiting_for: waiting_for.map(str::to_owned),
+            started_at_ms: Some(1_779_879_012_962),
+            updated_at_ms: Some(1_779_880_048_961),
+        }
+    }
+
+    #[test]
+    fn claude_session_status_drives_state() {
+        assert_eq!(
+            claude_session_state(&make_session_record(
+                Some("waiting"),
+                Some("permission prompt")
+            )),
+            Some(AgentState::AwaitingUser)
+        );
+        assert_eq!(
+            claude_session_state(&make_session_record(Some("busy"), None)),
+            Some(AgentState::Active)
+        );
+        assert_eq!(
+            claude_session_state(&make_session_record(Some("idle"), None)),
+            Some(AgentState::Idle)
+        );
+    }
+
+    #[test]
+    fn unknown_claude_session_status_falls_back_to_transcript_state() {
+        assert_eq!(claude_session_state(&make_session_record(None, None)), None);
+        assert_eq!(
+            claude_session_state(&make_session_record(Some("new-future-status"), None)),
+            None
+        );
+    }
+
+    #[test]
+    fn claude_waiting_reason_labels_known_prompts() {
+        assert_eq!(
+            waiting_action_label("permission prompt"),
+            "Permission prompt"
+        );
+        assert_eq!(
+            waiting_action_label("approve AskUserQuestion"),
+            "Asking question"
+        );
+        assert_eq!(waiting_action_label("other"), "Waiting");
     }
 
     #[test]

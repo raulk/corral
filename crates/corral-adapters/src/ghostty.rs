@@ -8,6 +8,7 @@
 use crate::adapter::{AdapterError, FocusContext, FocusOutcome, TerminalAdapter};
 use crate::generic::GenericAdapter;
 use crate::iterm2::{applescript_string, run_osascript};
+use corral_core::agent::Tool;
 use corral_core::proc::{ProcessId, process_parent};
 use corral_core::trace::{self, FocusStrategy, TraceEvent};
 use std::sync::OnceLock;
@@ -220,29 +221,65 @@ impl GhosttyAdapter {
             return Err(AdapterError::Unavailable("no cwd".into()));
         };
         let cwd = applescript_string(&cwd.to_string_lossy());
-        let script = format!(
-            r#"
-            tell application "Ghostty"
-                set terms to terminals
-                if (count of terms) = 0 then return "not-found"
-                try
-                    set _probe to working directory of item 1 of terms
-                on error errMsg
-                    return "unsupported:" & errMsg
-                end try
-                repeat with t in terms
-                    if (working directory of t) is {cwd} then
-                        focus t
-                        return "ok"
-                    end if
-                end repeat
-                return "not-found"
-            end tell
-            "#,
-            cwd = cwd
-        );
+        let script = if matches!(ctx.tool, Tool::Claude) {
+            cwd_focus_first_match_script(&cwd)
+        } else {
+            cwd_focus_unique_script(&cwd)
+        };
         run_osascript(&script)
     }
+}
+
+fn cwd_focus_first_match_script(cwd: &str) -> String {
+    format!(
+        r#"
+        tell application "Ghostty"
+            set terms to terminals
+            if (count of terms) = 0 then return "not-found"
+            try
+                set _probe to working directory of item 1 of terms
+            on error errMsg
+                return "unsupported:" & errMsg
+            end try
+            repeat with t in terms
+                if (working directory of t) is {cwd} then
+                    focus t
+                    return "ok"
+                end if
+            end repeat
+            return "not-found"
+        end tell
+        "#,
+        cwd = cwd
+    )
+}
+
+fn cwd_focus_unique_script(cwd: &str) -> String {
+    format!(
+        r#"
+        tell application "Ghostty"
+            set terms to terminals
+            if (count of terms) = 0 then return "not-found"
+            try
+                set _probe to working directory of item 1 of terms
+            on error errMsg
+                return "unsupported:" & errMsg
+            end try
+            set matches to {{}}
+            repeat with t in terms
+                if (working directory of t) is {cwd} then
+                    set end of matches to t
+                end if
+            end repeat
+            set matchCount to count of matches
+            if matchCount = 0 then return "not-found"
+            if matchCount > 1 then return "ambiguous:" & matchCount
+            focus item 1 of matches
+            return "ok"
+        end tell
+        "#,
+        cwd = cwd
+    )
 }
 
 fn candidate_child_pids(ctx: &FocusContext) -> Vec<ProcessId> {
@@ -275,6 +312,7 @@ mod tests {
     fn ctx_no_tty_no_cwd() -> FocusContext {
         FocusContext {
             cli_pid: ProcessId(42),
+            tool: Tool::Claude,
             cli_tty: None,
             parent_app: None,
             cwd: None,
@@ -285,6 +323,7 @@ mod tests {
     fn ctx_with_cwd(path: &str) -> FocusContext {
         FocusContext {
             cli_pid: ProcessId(42),
+            tool: Tool::CodexCli,
             cli_tty: None,
             parent_app: None,
             cwd: Some(PathBuf::from(path)),
@@ -335,6 +374,21 @@ mod tests {
             inner.contains(r"\\"),
             "missing escaped backslash in: {inner}"
         );
+    }
+
+    #[test]
+    fn focus_by_cwd_script_rejects_ambiguous_matches() {
+        let script = cwd_focus_unique_script(&applescript_string("/tmp/foo"));
+        assert!(script.contains("set matches to {}"));
+        assert!(script.contains("if matchCount > 1 then return \"ambiguous:\" & matchCount"));
+        assert!(script.contains("focus item 1 of matches"));
+    }
+
+    #[test]
+    fn claude_cwd_script_keeps_legacy_first_match_behavior() {
+        let script = cwd_focus_first_match_script(&applescript_string("/tmp/foo"));
+        assert!(!script.contains("ambiguous:"));
+        assert!(script.contains("focus t"));
     }
 
     // Strategy ordering: when caps say has_tty=false + has_pid=false + has_cwd=true,

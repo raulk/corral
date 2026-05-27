@@ -343,8 +343,13 @@ fn handle_focus(sys_tx: &Sender<SystemEvent>, pid: i32, request_id: u64) -> Resu
         .iter()
         .find(|a| a.pid == ProcessId(pid))
         .ok_or_else(|| format!("no agent for pid {pid}"))?;
-    crate::focus::focus_for_request(request_id, agent.pid, agent.tty.clone(), agent.cwd.clone());
-    Ok(())
+    crate::focus::focus_for_request(
+        request_id,
+        agent.pid,
+        agent.tool,
+        agent.tty.clone(),
+        agent.cwd.clone(),
+    )
 }
 
 #[cfg(test)]

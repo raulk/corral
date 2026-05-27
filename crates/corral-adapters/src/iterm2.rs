@@ -81,6 +81,11 @@ pub(crate) fn run_osascript(script: &str) -> Result<(), AdapterError> {
         if last == "not-found" || last == "no-match" || last == "no-tab" {
             return Err(AdapterError::NotFound(last.into()));
         }
+        if let Some(count) = last.strip_prefix("ambiguous:") {
+            return Err(AdapterError::NotFound(format!(
+                "ambiguous target: {count} matches"
+            )));
+        }
         if let Some(reason) = last.strip_prefix("unsupported:") {
             return Err(AdapterError::Unavailable(reason.trim().into()));
         }
